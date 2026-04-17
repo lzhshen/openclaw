@@ -591,20 +591,23 @@ classDiagram
 
 ## 6. 核心协作流程
 
-### 6.1 应用启动与 WebSocket 连接建立（Token 认证）
+### 6.1 应用启动与 WebSocket 连接建立（挑战握手 + 设备签名连接）
 
-本方案采用 Gateway 的 **Token 认证模式**（`gateway.auth.mode="token"`）。Token 通过 K8s Secret 注入为环境变量 `OPENCLAW_GATEWAY_TOKEN`，Gateway 与 Chatbot 读取同一个 Secret 值。
+本节从**后端类协作**角度总结 Gateway 的建连流程。对新的 operator 客户端，推荐把握手建模为：**WebSocket 建立后，按正常 operator 路径处理 `connect.challenge`，再发送带共享认证信息与 `device` 签名的 `connect` 请求；首次连接成功后持久化 `hello-ok.auth.deviceToken`，后续重连优先复用同一设备身份与已持久化的 device token。**
+
+如果部署侧仍使用共享 token（例如通过环境变量 `OPENCLAW_GATEWAY_TOKEN` 注入），它属于**首次连接时的共享认证材料**，而不是“可替代设备身份的主流程”。在当前客户端实现里，token-only 更适合作为 plain HTTP / insecure compatibility 等受限场景下的回退路径，不应作为新后端客户端的默认建模方式。
 
 **认证流程概览：**
 
 ```
-WS open → Gateway 发 challenge → Chatbot 用 token 回应 connect → Gateway 验证 token → 返回 HelloOk
+WebSocket open → Gateway 按正常 operator 路径发 `connect.challenge` → Chatbot 使用共享认证信息 + `device` 签名发送 connect → Gateway 返回 hello-ok（含 deviceToken）→ Chatbot 持久化 deviceToken → 再订阅 sessions / 进入后续 RPC
 ```
 
-选择 Token 模式的原因：
-1. **最简实现**：只需一个环境变量，无需 Ed25519 密钥对生成和挑战签名
-2. **同 Pod 安全性足够**：token 不经过外部网络
-3. **无需 Device 签名**：operator 角色 + 有效共享密钥可省略 `device` 字段
+按这一设计建模的原因：
+1. **符合协议主路径**：`connect.challenge` 是新的 operator 客户端正常握手的一部分，不应被当成可忽略事件
+2. **稳定承载设备身份与 scopes**：首次连接使用共享认证信息 + `device` 签名，更符合当前 Gateway 对 operator 客户端的建模
+3. **建立可持续的重连路径**：首次成功后可持久化 `hello-ok.auth.deviceToken`，后续重连优先复用已批准的 device token
+4. **保留兼容回退说明**：token-only 可能在不安全上下文或兼容模式下出现，但不应在类设计中被写成推荐主流程
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#282c34', 'edgeLabelBackground': '#282c34', 'mainBkg': '#282c34', 'primaryTextColor': '#abb2bf', 'lineColor': '#abb2bf', 'tertiaryColor': '#21252b', 'clusterBkg': '#21252b', 'clusterBorder': '#61afef', 'fontFamily': 'arial', 'actorBkg': '#282c34', 'actorBorder': '#61afef', 'actorTextColor': '#abb2bf', 'signalColor': '#abb2bf', 'signalTextColor': '#abb2bf', 'noteBkgColor': '#21252b', 'noteTextColor': '#abb2bf', 'noteBorderColor': '#61afef'}}}%%
@@ -615,31 +618,32 @@ sequenceDiagram
     participant FC as GatewayFrameCodec
     participant GW as Gateway (WebSocket)
 
-    Note over App,GW: Token 来源：K8s Secret → 环境变量 OPENCLAW_GATEWAY_TOKEN<br/>Gateway 与 Chatbot 读取同一个 Secret
+    Note over App,GW: 首次连接通常使用共享认证信息 + device-signed connect<br/>若部署使用共享 token，可来自环境变量 OPENCLAW_GATEWAY_TOKEN
 
     Note over App: @PostConstruct 触发
 
     App->>GWC: afterPropertiesSet()
     GWC->>GWC: connect()
-    Note over GWC: 读取 gatewayToken =<br/>System.getenv("OPENCLAW_GATEWAY_TOKEN")
+    Note over GWC: 读取共享认证材料，准备本地 device identity / 已持久化 deviceToken
 
-    GWC->>GW: WS open (ws://localhost:18789)
+    GWC->>GW: WS open
     GW-->>GWC: event "connect.challenge" {nonce, ts}
 
-    Note over GWC,FC: 准备 ConnectParams：<br/>minProtocol=3, maxProtocol=3<br/>client.id="webchat", client.mode="backend"<br/>role="operator"<br/>scopes=["operator.read", "operator.write"]<br/>auth.token = gatewayToken (来自环境变量)<br/>device 字段省略（Token 模式下不需要）
+    Note over GWC,FC: 准备 ConnectParams：<br/>minProtocol=3, maxProtocol=3<br/>client.id="webchat", client.mode="backend"<br/>role="operator"<br/>scopes=["operator.read", "operator.write"]<br/>auth: 可包含 token/password，且在当前实现中也可能带已解析的 deviceToken<br/>device: {id, publicKey, signature, signedAt, nonce}
 
-    GWC->>FC: encodeConnectParams(gatewayToken, "webchat")
+    GWC->>FC: encodeConnectParams(...)
     FC-->>GWC: JSON connect frame
 
-    GWC->>GW: req "connect" {<br/>  minProtocol:3, maxProtocol:3,<br/>  client:{id:"webchat", mode:"backend"},<br/>  auth:{token: gatewayToken},<br/>  role:"operator",<br/>  scopes:["operator.read","operator.write"]<br/>}
+    GWC->>GW: req "connect" {<br/>  minProtocol:3, maxProtocol:3,<br/>  client:{id:"webchat", mode:"backend"},<br/>  auth:{token?, password?, deviceToken?},<br/>  role:"operator",<br/>  scopes:["operator.read","operator.write"],<br/>  device:{id, publicKey, signature, signedAt, nonce}<br/>}
 
-    Note over GW: 验证 auth.token 与<br/>本地配置的 gateway.auth.token 一致<br/>operator + 共享密钥 → 省略 device 合法
+    Note over GW: 按当前认证路径校验 auth 字段，<br/>并校验 challenge nonce 对应的 device 签名
 
-    GW-->>GWC: res {ok:true, payload: HelloOk}
+    GW-->>GWC: res {ok:true, payload: hello-ok}
 
-    Note over GWC: HelloOk 包含：<br/>- features.methods: 可用 RPC 列表<br/>- features.events: 可用事件列表<br/>- policy: {maxPayload, tickIntervalMs}<br/>- snapshot: Gateway 当前状态
+    Note over GWC: hello-ok 关键字段：<br/>- auth.deviceToken：首次成功后需持久化<br/>- auth.role / auth.scopes<br/>- features.methods / features.events<br/>- policy / snapshot
 
     GWC->>GWC: handleResponse() → connected.set(true)
+    GWC->>GWC: persist hello-ok.auth.deviceToken
 
     GWC->>GWC: sessionsSubscribe()
     GWC->>FC: encodeRequest(id, "sessions.subscribe", {})
@@ -647,20 +651,21 @@ sequenceDiagram
     GW-->>GWC: res {ok:true, subscribed:true}
 
     GWC->>GWC: scheduleHeartbeat()
-    Note over GWC,GW: 连接就绪。监听 tick 事件维持心跳。<br/>Token 为静态值，不会动态变化。
+    Note over GWC,GW: 后续重连通常仍按当前 operator 路径处理 connect.challenge，<br/>优先复用已持久化的 deviceToken + 同一 device identity
 ```
 
 **关键点：**
 
 | 要点 | 说明 |
 |------|------|
-| **Token 来源** | K8s Secret 注入环境变量 `OPENCLAW_GATEWAY_TOKEN`，Gateway 与 Chatbot 读取同一 Secret |
-| **Token 性质** | 静态值，部署时确定，不随连接变化，不过期。更换需更新 Secret 并重启 Pod |
-| **认证方式** | `auth: { token: "<gateway-token>" }`，**不需要** device 签名 |
-| **省略 device 的条件** | `role="operator"` + 有效共享密钥 → Gateway 允许省略 `device` 字段 |
-| **connect.challenge** | Token 模式下，challenge 事件中的 nonce 主要作为协议握手的一部分。Token 验证是直接比对共享密钥，不依赖 nonce 签名 |
-| **连接生命周期** | `GatewayWebSocketClient` 在 `@PostConstruct` 阶段自动建立连接，连接成功后立即调用 `sessionsSubscribe()` 注册事件订阅 |
-| **心跳监控** | `scheduleHeartbeat()` 监控 `tick` 事件，超时则触发 `reconnect()` |
+| **共享认证材料来源** | 若部署使用共享 token，可由环境变量 `OPENCLAW_GATEWAY_TOKEN` 注入；它主要用于首次连接时的共享认证 |
+| **典型握手顺序** | 正常 operator 路径通常表现为 `WS open` → `connect.challenge` → device-signed `connect` → `hello-ok` → 持久化 `auth.deviceToken` → 再发 `sessions.subscribe` 等后续 RPC |
+| **首次连接认证方式** | 推荐使用共享 `token/password` + `device` 签名；在当前实现中，`auth` 里也可能携带已解析的 `deviceToken` |
+| **重连认证方式** | 首次成功后持久化 `hello-ok.auth.deviceToken`，后续重连优先复用该 token，并保持同一 device identity |
+| **connect.challenge** | challenge 中的 nonce 需要进入 `device` 签名 payload；对新的 operator 客户端，应把它视为正常握手路径的一部分 |
+| **token-only 的定位** | 在当前客户端实现里，可作为 plain HTTP / insecure compatibility 等场景下的 fallback，但不应写成推荐主流程 |
+| **连接生命周期** | `GatewayWebSocketClient` 在 `@PostConstruct` 阶段自动建连；收到 `hello-ok` 后再注册 `sessions.subscribe()` 并启动心跳监控 |
+| **心跳监控** | `scheduleHeartbeat()` 监控 `tick` 事件，超时则触发 `reconnect()`；重连流程仍应重复 challenge + connect 链路 |
 
 ---
 
